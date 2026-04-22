@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 logger = logging.getLogger(__name__)
+import math
 import os
 import random
 import re
@@ -892,6 +893,7 @@ class AIAgent:
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.service_tier = service_tier
         self.request_overrides = dict(request_overrides or {})
+        self._routing_budget_tokens: Optional[int] = None
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
         
@@ -2332,6 +2334,192 @@ class AIAgent:
         if self._is_direct_openai_url():
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
+
+    @staticmethod
+    def _current_output_cap_keys(api_kwargs: dict) -> tuple[list[str], Optional[int]]:
+        keys: list[str] = []
+        for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+            value = api_kwargs.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                keys.append(key)
+        requested = int(api_kwargs[keys[0]]) if keys else None
+        return keys, requested
+
+    @staticmethod
+    def _set_output_cap(api_kwargs: dict, value: int, *, keys: list[str] | None = None, fallback_key: str | None = None) -> None:
+        target_keys = list(keys or [])
+        if not target_keys and fallback_key:
+            target_keys = [fallback_key]
+        for key in target_keys:
+            api_kwargs[key] = int(value)
+
+    def _routing_reasoning_effort(self) -> str:
+        config = self.reasoning_config if isinstance(self.reasoning_config, dict) else {}
+        if config.get("enabled") is False:
+            return "none"
+        return str(config.get("effort") or "medium").strip().lower() or "medium"
+
+    def _routing_budget_reserve(self, *, tools_enabled: bool) -> int:
+        reserve = 64
+        if tools_enabled:
+            reserve += 64
+        reserve += {
+            "low": 0,
+            "medium": 32,
+            "high": 64,
+            "xhigh": 128,
+        }.get(self._routing_reasoning_effort(), 0)
+        return reserve
+
+    @staticmethod
+    def _routing_output_floor(requested_max_tokens: int) -> int:
+        requested = max(int(requested_max_tokens), 1)
+        if requested <= 96:
+            return min(requested, 48)
+        if requested <= 480:
+            return min(requested, 128)
+        if requested <= 1536:
+            return min(requested, 384)
+        return min(requested, 768)
+
+    def _estimate_prompt_tokens(
+        self,
+        *,
+        messages: list,
+        system_prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        try:
+            return max(
+                0,
+                int(
+                    estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=system_prompt,
+                        tools=tools,
+                    )
+                ),
+            )
+        except Exception as exc:
+            logger.debug("Prompt token estimate failed for %s: %s", self.model, exc)
+            return 0
+
+    def _budgeted_output_cap(
+        self,
+        *,
+        requested_max_tokens: Optional[int],
+        prompt_tokens: int,
+        tools_enabled: bool,
+    ) -> tuple[Optional[int], dict[str, Any]]:
+        requested = None
+        if isinstance(requested_max_tokens, (int, float)) and requested_max_tokens > 0:
+            requested = int(requested_max_tokens)
+
+        metrics = {
+            "budget_tokens": None,
+            "prompt_tokens": max(int(prompt_tokens or 0), 0),
+            "reserve_tokens": 0,
+            "requested_max_tokens": requested,
+            "effective_max_tokens": requested,
+            "budget_ratio": 1.0,
+        }
+        if requested is None:
+            return None, metrics
+
+        try:
+            budget_tokens = int(getattr(self, "_routing_budget_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            budget_tokens = 0
+        if budget_tokens <= 0:
+            return requested, metrics
+
+        reserve_tokens = self._routing_budget_reserve(tools_enabled=tools_enabled)
+        available_tokens = budget_tokens - metrics["prompt_tokens"] - reserve_tokens
+        effective_max = min(
+            requested,
+            max(self._routing_output_floor(requested), int(available_tokens)),
+        )
+        effective_max = max(16, effective_max)
+        ratio = max(0.0, min(float(effective_max) / float(requested), 1.0))
+        metrics.update(
+            {
+                "budget_tokens": budget_tokens,
+                "reserve_tokens": reserve_tokens,
+                "effective_max_tokens": effective_max,
+                "budget_ratio": ratio,
+            }
+        )
+        return effective_max, metrics
+
+    def _budget_adjusted_temperature(
+        self,
+        base_temperature: Any,
+        *,
+        requested_max_tokens: Optional[int],
+        effective_max_tokens: Optional[int],
+        tools_enabled: bool,
+    ) -> Optional[float]:
+        if base_temperature is None:
+            return None
+        try:
+            base = float(base_temperature)
+        except (TypeError, ValueError):
+            return None
+        if base <= 0:
+            return 0.0
+
+        requested = int(requested_max_tokens or 0)
+        effective = int(effective_max_tokens or requested or 0)
+        if requested <= 0 or effective <= 0:
+            return round(base, 3)
+
+        ratio = max(0.0, min(float(effective) / float(requested), 1.0))
+        adjusted = base * math.sqrt(ratio)
+        if tools_enabled:
+            adjusted *= 0.85 if ratio < 0.75 else 0.9
+        if effective <= 96:
+            adjusted = min(adjusted, 0.45)
+        elif effective <= 256:
+            adjusted = min(adjusted, 0.55)
+        adjusted = min(base, adjusted)
+        adjusted = max(0.1, adjusted)
+        return round(min(adjusted, 1.0), 3)
+
+    def _log_routing_budget_adjustment(
+        self,
+        *,
+        api_mode: str,
+        metrics: dict[str, Any],
+        base_temperature: Any = None,
+        adjusted_temperature: Any = None,
+        fixed_temperature: Any = None,
+        tools_enabled: bool = False,
+    ) -> None:
+        if metrics.get("budget_tokens") is None:
+            return
+        requested = metrics.get("requested_max_tokens")
+        effective = metrics.get("effective_max_tokens")
+        if (
+            requested == effective
+            and base_temperature == adjusted_temperature
+            and fixed_temperature is None
+        ):
+            return
+        logger.debug(
+            "[RoutingBudget] mode=%s model=%s prompt=%s budget=%s reserve=%s requested=%s effective=%s ratio=%.2f temp=%s->%s fixed=%s tools=%s",
+            api_mode,
+            self.model,
+            metrics.get("prompt_tokens"),
+            metrics.get("budget_tokens"),
+            metrics.get("reserve_tokens"),
+            requested,
+            effective,
+            float(metrics.get("budget_ratio", 1.0) or 1.0),
+            base_temperature,
+            adjusted_temperature,
+            fixed_temperature,
+            tools_enabled,
+        )
 
     def _has_content_after_think_block(self, content: str) -> bool:
         """
@@ -7150,11 +7338,25 @@ class AIAgent:
             ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
             if ephemeral_out is not None:
                 self._ephemeral_max_output_tokens = None  # consume immediately
+            prompt_tokens = self._estimate_prompt_tokens(
+                messages=api_messages,
+                tools=self.tools,
+            )
+            effective_max_tokens, budget_metrics = self._budgeted_output_cap(
+                requested_max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
+                prompt_tokens=prompt_tokens,
+                tools_enabled=bool(self.tools),
+            )
+            self._log_routing_budget_adjustment(
+                api_mode="anthropic_messages",
+                metrics=budget_metrics,
+                tools_enabled=bool(self.tools),
+            )
             return build_anthropic_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
                 tools=self.tools,
-                max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
+                max_tokens=effective_max_tokens,
                 reasoning_config=self.reasoning_config,
                 is_oauth=self._is_anthropic_oauth,
                 preserve_dots=self._anthropic_preserve_dots(),
@@ -7169,6 +7371,20 @@ class AIAgent:
             from agent.bedrock_adapter import build_converse_kwargs
             region = getattr(self, "_bedrock_region", None) or "us-east-1"
             guardrail = getattr(self, "_bedrock_guardrail_config", None)
+            prompt_tokens = self._estimate_prompt_tokens(
+                messages=api_messages,
+                tools=self.tools,
+            )
+            effective_max_tokens, budget_metrics = self._budgeted_output_cap(
+                requested_max_tokens=self.max_tokens or 4096,
+                prompt_tokens=prompt_tokens,
+                tools_enabled=bool(self.tools),
+            )
+            self._log_routing_budget_adjustment(
+                api_mode="bedrock_converse",
+                metrics=budget_metrics,
+                tools_enabled=bool(self.tools),
+            )
             return {
                 "__bedrock_converse__": True,
                 "__bedrock_region__": region,
@@ -7176,7 +7392,7 @@ class AIAgent:
                     model=self.model,
                     messages=api_messages,
                     tools=self.tools,
-                    max_tokens=self.max_tokens or 4096,
+                    max_tokens=effective_max_tokens or 4096,
                     temperature=None,  # Let the model use its default
                     guardrail_config=guardrail,
                 ),
@@ -7252,6 +7468,53 @@ class AIAgent:
 
             if self.max_tokens is not None and not is_codex_backend:
                 kwargs["max_output_tokens"] = self.max_tokens
+
+            prompt_tokens = self._estimate_prompt_tokens(
+                messages=payload_messages,
+                system_prompt=instructions,
+                tools=kwargs.get("tools") or [],
+            )
+            requested_max_tokens = kwargs.get("max_output_tokens")
+            if not isinstance(requested_max_tokens, (int, float)) or requested_max_tokens <= 0:
+                requested_max_tokens = self.max_tokens
+            effective_max_tokens, budget_metrics = self._budgeted_output_cap(
+                requested_max_tokens=requested_max_tokens,
+                prompt_tokens=prompt_tokens,
+                tools_enabled=bool(kwargs.get("tools")),
+            )
+            if effective_max_tokens is not None and not is_codex_backend:
+                kwargs["max_output_tokens"] = effective_max_tokens
+            base_temperature = kwargs.get("temperature")
+            try:
+                from agent.auxiliary_client import _fixed_temperature_for_model
+            except Exception:
+                _fixed_temperature_for_model = None
+            fixed_temperature = (
+                _fixed_temperature_for_model(self.model, self.base_url)
+                if _fixed_temperature_for_model is not None
+                else None
+            )
+            adjusted_temperature = base_temperature
+            if fixed_temperature is not None:
+                kwargs["temperature"] = fixed_temperature
+                adjusted_temperature = fixed_temperature
+            elif base_temperature is not None:
+                adjusted_temperature = self._budget_adjusted_temperature(
+                    base_temperature,
+                    requested_max_tokens=requested_max_tokens,
+                    effective_max_tokens=effective_max_tokens,
+                    tools_enabled=bool(kwargs.get("tools")),
+                )
+                if adjusted_temperature is not None:
+                    kwargs["temperature"] = adjusted_temperature
+            self._log_routing_budget_adjustment(
+                api_mode="codex_responses",
+                metrics=budget_metrics,
+                base_temperature=base_temperature,
+                adjusted_temperature=adjusted_temperature,
+                fixed_temperature=fixed_temperature,
+                tools_enabled=bool(kwargs.get("tools")),
+            )
 
             if is_xai_responses and getattr(self, "session_id", None):
                 kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
@@ -7341,6 +7604,7 @@ class AIAgent:
             from agent.auxiliary_client import _fixed_temperature_for_model
         except Exception:
             _fixed_temperature_for_model = None
+        fixed_temperature = None
         if _fixed_temperature_for_model is not None:
             fixed_temperature = _fixed_temperature_for_model(self.model, self.base_url)
             if fixed_temperature is not None:
@@ -7462,6 +7726,47 @@ class AIAgent:
         # Applied last so overrides win over any defaults set above.
         if self.request_overrides:
             api_kwargs.update(self.request_overrides)
+
+        output_cap_keys, requested_max_tokens = self._current_output_cap_keys(api_kwargs)
+        prompt_tokens = self._estimate_prompt_tokens(
+            messages=api_kwargs.get("messages") or sanitized_messages,
+            tools=api_kwargs.get("tools") or [],
+        )
+        effective_max_tokens, budget_metrics = self._budgeted_output_cap(
+            requested_max_tokens=requested_max_tokens,
+            prompt_tokens=prompt_tokens,
+            tools_enabled=bool(api_kwargs.get("tools")),
+        )
+        if effective_max_tokens is not None:
+            self._set_output_cap(
+                api_kwargs,
+                effective_max_tokens,
+                keys=output_cap_keys,
+                fallback_key=next(iter(self._max_tokens_param(effective_max_tokens))),
+            )
+
+        base_temperature = api_kwargs.get("temperature")
+        adjusted_temperature = base_temperature
+        if fixed_temperature is not None:
+            api_kwargs["temperature"] = fixed_temperature
+            adjusted_temperature = fixed_temperature
+        elif base_temperature is not None:
+            adjusted_temperature = self._budget_adjusted_temperature(
+                base_temperature,
+                requested_max_tokens=requested_max_tokens,
+                effective_max_tokens=effective_max_tokens,
+                tools_enabled=bool(api_kwargs.get("tools")),
+            )
+            if adjusted_temperature is not None:
+                api_kwargs["temperature"] = adjusted_temperature
+        self._log_routing_budget_adjustment(
+            api_mode="chat_completions",
+            metrics=budget_metrics,
+            base_temperature=base_temperature,
+            adjusted_temperature=adjusted_temperature,
+            fixed_temperature=fixed_temperature,
+            tools_enabled=bool(api_kwargs.get("tools")),
+        )
 
         return api_kwargs
 

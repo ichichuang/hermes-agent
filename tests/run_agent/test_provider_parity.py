@@ -264,6 +264,59 @@ class TestBuildApiKwargsKimiFixedTemperature:
         assert kwargs["temperature"] == 0.6
 
 
+class TestBuildApiKwargsRoutingBudget:
+    def test_chat_budget_reduces_max_tokens_and_temperature(self, monkeypatch):
+        monkeypatch.setattr("run_agent.estimate_request_tokens_rough", lambda *a, **k: 180)
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "gpt-5.1"
+        agent.max_tokens = 480
+        agent.request_overrides = {"temperature": 0.7}
+        agent._routing_budget_tokens = 320
+        agent.tools = []
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["max_tokens"] == 128
+        assert kwargs["temperature"] == pytest.approx(0.361, abs=1e-3)
+
+    def test_fixed_temperature_wins_over_budget_adjustment(self, monkeypatch):
+        monkeypatch.setattr("run_agent.estimate_request_tokens_rough", lambda *a, **k: 260)
+        agent = _make_agent(
+            monkeypatch,
+            "kimi-coding",
+            base_url="https://api.kimi.com/coding/v1",
+            model="kimi-for-coding",
+        )
+        agent.max_tokens = 480
+        agent.request_overrides = {"temperature": 0.2}
+        agent._routing_budget_tokens = 256
+        agent.tools = []
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["max_tokens"] == 128
+        assert kwargs["temperature"] == 0.6
+
+    def test_codex_responses_budget_reduces_max_output_tokens_and_temperature(self, monkeypatch):
+        monkeypatch.setattr("run_agent.estimate_request_tokens_rough", lambda *a, **k: 180)
+        agent = _make_agent(
+            monkeypatch,
+            "copilot",
+            api_mode="codex_responses",
+            base_url="https://api.githubcopilot.com",
+            model="gpt-5.4",
+        )
+        agent.max_tokens = 1500
+        agent.request_overrides = {"temperature": 0.5}
+        agent._routing_budget_tokens = 700
+        agent.tools = []
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["max_output_tokens"] == 424
+        assert kwargs["temperature"] == pytest.approx(0.266, abs=1e-3)
+
+
 class TestBuildApiKwargsAIGateway:
     def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")

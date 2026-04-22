@@ -47,6 +47,13 @@ class TestSlashCommands:
         runner.session_store.reset_session.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_explicit_natural_language_reset_resets_session(self, adapter, runner, platform):
+        send = await send_and_capture(adapter, "清理所有上下文 准备开始新任务", platform)
+
+        send.assert_called_once()
+        runner.session_store.reset_session.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_stop_when_no_agent_running(self, adapter, platform):
         send = await send_and_capture(adapter, "/stop", platform)
 

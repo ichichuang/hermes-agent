@@ -292,6 +292,12 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.intent_policy import (
+    decide_tool_policy,
+    looks_like_explicit_reset_request,
+    summarize_tool_decision,
+)
+from gateway.semantic_cache import cosine_similarity, vectorize_text
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -612,6 +618,9 @@ class GatewayRunner:
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _fast_response_cache: "OrderedDict[str, dict]" = OrderedDict()
+    _FAST_RESPONSE_CACHE_MAX = 256
+    _routing_feedback: Dict[str, Dict[str, Any]] = {}
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -671,6 +680,8 @@ class GatewayRunner:
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        self._fast_response_cache = OrderedDict()
+        self._routing_feedback = {}
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
@@ -1143,6 +1154,204 @@ class GatewayRunner:
         route["request_overrides"] = overrides
         return route
 
+    def _routing_feedback_key(self, session_key: str | None, user_id: str | None) -> str:
+        if str(session_key or "").strip():
+            return f"session:{str(session_key).strip()}"
+        if str(user_id or "").strip():
+            return f"user:{str(user_id).strip()}"
+        return "global"
+
+    def _routing_feedback_for(self, session_key: str | None, user_id: str | None) -> dict[str, Any]:
+        key = self._routing_feedback_key(session_key, user_id)
+        feedback = self._routing_feedback.get(key)
+        if isinstance(feedback, dict):
+            return dict(feedback)
+        return {
+            "used_tools_previously": False,
+            "retry_count": 0,
+            "previous_failure": False,
+            "previous_tier": "",
+            "decayed_penalty": 0.0,
+        }
+
+    def _update_routing_feedback(
+        self,
+        *,
+        session_key: str | None,
+        user_id: str | None,
+        used_tools: bool,
+        failed: bool,
+        routed_tier: str = "",
+    ) -> None:
+        key = self._routing_feedback_key(session_key, user_id)
+        existing = self._routing_feedback_for(session_key, user_id)
+        retry_count = int(existing.get("retry_count", 0) or 0)
+        if failed:
+            retry_count = min(retry_count + 1, 5)
+        else:
+            retry_count = 0
+        turn_penalty = 0.0
+        if used_tools:
+            turn_penalty += 0.2
+        if retry_count > 0:
+            turn_penalty += min(retry_count, 5) * 0.1
+        if failed:
+            turn_penalty += 0.2
+        historical_penalty = float(existing.get("decayed_penalty", 0.0) or 0.0)
+        self._routing_feedback[key] = {
+            "used_tools_previously": bool(used_tools),
+            "retry_count": retry_count,
+            "previous_failure": bool(failed),
+            "previous_tier": str(routed_tier or existing.get("previous_tier", "") or ""),
+            "decayed_penalty": min((historical_penalty * 0.8) + turn_penalty, 1.0),
+        }
+
+    def _resolve_lightweight_model(self, base_model: str, user_config: dict | None = None) -> str | None:
+        cfg = user_config or {}
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, dict):
+            for key in ("l0", "lightweight", "mini"):
+                candidate = str(model_cfg.get(key, "") or "").strip()
+                if candidate:
+                    return candidate
+
+        normalized = str(base_model or "").strip()
+        if not normalized:
+            return None
+
+        lower = normalized.lower()
+        if "gpt-5.4-mini" in lower:
+            return normalized
+        if "gpt-5.4" in lower:
+            return normalized.replace("gpt-5.4", "gpt-5.4-mini")
+        return None
+
+    def _resolve_router_model_map(
+        self,
+        base_model: str,
+        *,
+        lightweight_model: str | None = None,
+        user_config: dict | None = None,
+    ) -> dict[str, str]:
+        cfg = user_config or {}
+        model_cfg = cfg.get("model", {})
+        if not isinstance(model_cfg, dict):
+            return {}
+
+        routing_cfg = model_cfg.get("routing", {})
+        if not isinstance(routing_cfg, dict):
+            routing_cfg = {}
+
+        candidates = {
+            "mini": (
+                routing_cfg.get("mini"),
+                routing_cfg.get("l0"),
+                model_cfg.get("l0"),
+                model_cfg.get("mini"),
+                model_cfg.get("lightweight"),
+                lightweight_model,
+            ),
+            "standard": (
+                routing_cfg.get("standard"),
+                routing_cfg.get("l1"),
+                model_cfg.get("l1"),
+                model_cfg.get("standard"),
+            ),
+            "high": (
+                routing_cfg.get("high"),
+                routing_cfg.get("l2"),
+                model_cfg.get("l2"),
+                model_cfg.get("high"),
+            ),
+            "xhigh": (
+                routing_cfg.get("xhigh"),
+                routing_cfg.get("l3"),
+                model_cfg.get("l3"),
+                model_cfg.get("heavy"),
+                model_cfg.get("xhigh"),
+            ),
+        }
+
+        resolved: dict[str, str] = {}
+        for tier, values in candidates.items():
+            for candidate in values:
+                current = str(candidate or "").strip()
+                if current:
+                    resolved[tier] = current
+                    break
+
+        base = str(base_model or "").strip()
+        if not base:
+            return resolved
+
+        for tier in ("standard", "high", "xhigh"):
+            resolved.setdefault(tier, base)
+        resolved.setdefault("mini", str(lightweight_model or base).strip())
+        return resolved
+
+    def _fast_cache_get(self, input_text: str, cache_key: str, routing_bucket: str) -> Optional[str]:
+        text = str(input_text or "")
+        key = str(cache_key or "")
+        bucket = str(routing_bucket or "")
+        if not text or not key or not bucket:
+            return None
+        cache = getattr(self, "_fast_response_cache", None)
+        if cache is None:
+            return None
+
+        legacy_bucket = bucket.split("|", 1)[1] if "|" in bucket else bucket
+        legacy_key = f"{legacy_bucket}|{text}" if legacy_bucket and legacy_bucket != bucket else ""
+
+        exact = cache.get(key)
+        if exact is None and legacy_key:
+            exact = cache.get(legacy_key)
+        if isinstance(exact, dict):
+            matched_key = key if key in cache else legacy_key
+            if matched_key and hasattr(cache, "move_to_end"):
+                cache.move_to_end(matched_key)
+            return str(exact.get("response") or "")
+
+        query_vector = vectorize_text(text)
+        best_key = None
+        best_score = 0.0
+        best_response = None
+        for cache_key, payload in cache.items():
+            if not isinstance(payload, dict):
+                continue
+            payload_bucket = str(payload.get("routing_bucket") or "")
+            if payload_bucket not in {bucket, legacy_bucket}:
+                continue
+            score = cosine_similarity(query_vector, payload.get("vector") or {})
+            if score > 0.90 and score > best_score:
+                best_key = cache_key
+                best_score = score
+                best_response = str(payload.get("response") or "")
+
+        if best_key is not None and hasattr(cache, "move_to_end"):
+            cache.move_to_end(best_key)
+        return best_response
+
+    def _fast_cache_put(self, input_text: str, response_text: str, cache_key: str, routing_bucket: str) -> None:
+        key = str(cache_key or "")
+        bucket = str(routing_bucket or "")
+        text = str(input_text or "")
+        value = str(response_text or "")
+        if not key or not bucket or not text or not value:
+            return
+        cache = getattr(self, "_fast_response_cache", None)
+        if cache is None:
+            return
+        cache[key] = {
+            "input_text": text,
+            "response": value,
+            "routing_bucket": bucket,
+            "vector": vectorize_text(text),
+        }
+        if hasattr(cache, "move_to_end"):
+            cache.move_to_end(key)
+        while len(cache) > int(getattr(self, "_FAST_RESPONSE_CACHE_MAX", 256)):
+            cache.popitem(last=False)
+
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
@@ -1343,6 +1552,19 @@ class GatewayRunner:
         return result
 
     @staticmethod
+    def _reasoning_config_for_effort(effort: str) -> dict | None:
+        """Parse a routing-selected reasoning effort into agent config format."""
+        from hermes_constants import parse_reasoning_effort
+
+        selected = str(effort or "").strip().lower()
+        if not selected:
+            return None
+        result = parse_reasoning_effort(selected)
+        if result is None:
+            logger.warning("Unknown routed reasoning_effort '%s', using default (medium)", effort)
+        return result
+
+    @staticmethod
     def _load_service_tier() -> str | None:
         """Load Priority Processing setting from config.yaml.
 
@@ -1368,6 +1590,32 @@ class GatewayRunner:
             return "priority"
         logger.warning("Unknown service_tier '%s', ignoring", raw)
         return None
+
+    @staticmethod
+    def _build_session_meta_entry(
+        *,
+        agent_result: dict[str, Any] | None,
+        source,
+        timestamp: str,
+        fallback_model: str | None = None,
+    ) -> dict[str, Any]:
+        result = dict(agent_result or {})
+        model = str(result.get("model") or fallback_model or "").strip()
+        return {
+            "role": "session_meta",
+            "tools": result.get("tools", []) or [],
+            "intent_level": result.get("intent_level"),
+            "tool_mode": result.get("tool_mode"),
+            "enabled_toolsets": result.get("enabled_toolsets", []),
+            "model": model,
+            "routing_tier": result.get("routing_tier"),
+            "reasoning_effort": result.get("reasoning_effort"),
+            "routing_complexity": result.get("routing_complexity"),
+            "cache_hit": bool(result.get("cache_hit", False)),
+            "max_tokens": result.get("max_tokens"),
+            "platform": source.platform.value if source.platform else "",
+            "timestamp": timestamp,
+        }
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -3107,6 +3355,20 @@ class GatewayRunner:
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
 
+        _natural_reset = (
+            not event.is_command()
+            and event.message_type == MessageType.TEXT
+            and looks_like_explicit_reset_request(event.text or "")
+        )
+        if _natural_reset:
+            logger.info(
+                "Natural-language reset request detected: platform=%s user=%s chat=%s text=%r",
+                source.platform.value if source.platform else "unknown",
+                source.user_name or source.user_id or "unknown",
+                source.chat_id or "unknown",
+                (event.text or "")[:120],
+            )
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -3204,7 +3466,7 @@ class GatewayRunner:
             # clear the adapter's pending queue so the stale "/reset" text
             # doesn't get re-processed as a user message after the
             # interrupt completes.
-            if _cmd_def_inner and _cmd_def_inner.name == "new":
+            if (_cmd_def_inner and _cmd_def_inner.name == "new") or _natural_reset:
                 # Clear any pending messages so the old text doesn't replay
                 await self._interrupt_and_clear_session(
                     _quick_key,
@@ -3431,6 +3693,9 @@ class GatewayRunner:
         # Resolve aliases to canonical name so dispatch only checks canonicals.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+
+        if _natural_reset:
+            return await self._handle_reset_command(event)
 
         if canonical == "new":
             return await self._handle_reset_command(event)
@@ -4580,16 +4845,14 @@ class GatewayRunner:
             if agent_failed_early:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
-                tool_defs = agent_result.get("tools", [])
                 self.session_store.append_to_transcript(
                     session_entry.session_id,
-                    {
-                        "role": "session_meta",
-                        "tools": tool_defs or [],
-                        "model": _resolve_gateway_model(),
-                        "platform": source.platform.value if source.platform else "",
-                        "timestamp": ts,
-                    }
+                    self._build_session_meta_entry(
+                        agent_result=agent_result,
+                        source=source,
+                        timestamp=ts,
+                        fallback_model=_resolve_gateway_model(),
+                    ),
                 )
             
             # Find only the NEW messages from this turn (skip history we loaded).
@@ -4634,6 +4897,15 @@ class GatewayRunner:
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+            )
+            logger.info(
+                "Adaptive turn complete: session=%s intent=%s tool_mode=%s prompt_tokens=%s input_tokens=%s output_tokens=%s",
+                session_entry.session_id,
+                agent_result.get("intent_level", "unknown"),
+                agent_result.get("tool_mode", "unknown"),
+                agent_result.get("last_prompt_tokens", 0),
+                agent_result.get("input_tokens", 0),
+                agent_result.get("output_tokens", 0),
             )
 
             # Auto voice reply: send TTS audio before the text response
@@ -4849,6 +5121,12 @@ class GatewayRunner:
 
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
+        if old_entry and new_entry and new_entry.session_id == old_entry.session_id:
+            logger.error(
+                "Session reset failed to rotate session_id for %s; forcing new session entry",
+                session_key,
+            )
+            new_entry = self.session_store.get_or_create_session(source, force_new=True)
 
         # Clear any session-scoped model override so the next agent picks up
         # the configured default instead of the previously switched model.
@@ -8450,6 +8728,13 @@ class GatewayRunner:
         runtime: dict,
         enabled_toolsets: list,
         ephemeral_prompt: str,
+        intent: str = "",
+        tier: str = "",
+        reasoning_effort: str = "",
+        tools_enabled: bool = False,
+        input_text: str = "",
+        max_tokens: int | None = None,
+        request_overrides: dict | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -8460,25 +8745,25 @@ class GatewayRunner:
         """
         import hashlib, json as _j
 
-        # Fingerprint the FULL credential string instead of using a short
-        # prefix. OAuth/JWT-style tokens frequently share a common prefix
-        # (e.g. "eyJhbGci"), which can cause false cache hits across auth
-        # switches if only the first few characters are considered.
-        _api_key = str(runtime.get("api_key", "") or "")
-        _api_key_fingerprint = hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else ""
+        toolset_signature = hashlib.sha256(
+            _j.dumps(sorted(enabled_toolsets) if enabled_toolsets else [], default=str).encode()
+        ).hexdigest()[:16]
 
         blob = _j.dumps(
-            [
-                model,
-                _api_key_fingerprint,
-                runtime.get("base_url", ""),
-                runtime.get("provider", ""),
-                runtime.get("api_mode", ""),
-                sorted(enabled_toolsets) if enabled_toolsets else [],
-                # reasoning_config excluded — it's set per-message on the
-                # cached agent and doesn't affect system prompt or tools.
-                ephemeral_prompt or "",
-            ],
+            {
+                "model": model,
+                "provider": runtime.get("provider"),
+                "base_url": runtime.get("base_url"),
+                "api_mode": runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "ephemeral_prompt": str(ephemeral_prompt or ""),
+                "intent": intent,
+                "tier": tier,
+                "reasoning_effort": reasoning_effort,
+                "tools_enabled": bool(tools_enabled),
+                "toolset_signature": toolset_signature,
+            },
             sort_keys=True,
             default=str,
         )
@@ -9110,9 +9395,102 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        routing_feedback = self._routing_feedback_for(session_key, source.user_id)
+        session_override = self._session_model_overrides.get(session_key or "") if session_key else None
+        base_routing_model = (
+            (self._session_model_overrides.get(session_key or "", {}) or {}).get("model")
+            or _resolve_gateway_model(user_config)
+            or "gpt-5.4"
+        )
+        lightweight_model = self._resolve_lightweight_model(base_routing_model, user_config)
+        allow_model_tiering = not bool(str((session_override or {}).get("model", "") or "").strip())
+        if allow_model_tiering:
+            routing_model_map = self._resolve_router_model_map(
+                base_routing_model,
+                lightweight_model=lightweight_model,
+                user_config=user_config,
+            )
+        else:
+            routing_model_map = {
+                "mini": base_routing_model,
+                "standard": base_routing_model,
+                "high": base_routing_model,
+                "xhigh": base_routing_model,
+            }
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        tool_policy = decide_tool_policy(
+            message,
+            configured_toolsets,
+            model=base_routing_model,
+            lightweight_model=lightweight_model,
+            runtime_feedback=routing_feedback,
+            model_map=routing_model_map,
+            allow_model_tiering=allow_model_tiering,
+        )
+        enabled_toolsets = list(tool_policy.enabled_toolsets)
+        routed_reasoning_config = self._reasoning_config_for_effort(tool_policy.reasoning_effort)
+        routed_request_overrides = {"temperature": tool_policy.temperature}
+        fast_cache_bucket = "|".join(
+            [
+                tool_policy.model,
+                tool_policy.intent,
+                tool_policy.tier,
+                tool_policy.reasoning_effort,
+                str(bool(tool_policy.tools_enabled)).lower(),
+            ]
+        )
+        fast_cache_key = f"{fast_cache_bucket}|{message}"
+        can_use_fast_cache = bool(
+            tool_policy.cacheable
+            and not enabled_toolsets
+            and not history
+            and not context_prompt
+            and not (channel_prompt or "").strip()
+        )
+        logger.info(
+            "Adaptive runtime policy for %s: %s",
+            (session_key or source.chat_id or platform_key or "session")[:80],
+            summarize_tool_decision(tool_policy, configured_toolsets),
+        )
+        logger.info(
+            "[Router] Intent: %s, Complexity: %.2f, Tier: %s, Model: %s, Effort: %s, Tools: %s, MaxTokens: %s",
+            tool_policy.intent,
+            tool_policy.complexity,
+            tool_policy.tier,
+            tool_policy.model,
+            tool_policy.reasoning_effort,
+            tool_policy.tools_enabled,
+            tool_policy.max_tokens,
+        )
+
+        if can_use_fast_cache:
+            cached_response = self._fast_cache_get(message, fast_cache_key, fast_cache_bucket)
+            if cached_response is not None:
+                logger.info("[ModelRouter] Fast-path cache hit for cacheable input")
+                self._update_routing_feedback(
+                    session_key=session_key,
+                    user_id=source.user_id,
+                    used_tools=False,
+                    failed=False,
+                    routed_tier=tool_policy.tier,
+                )
+                return {
+                    "final_response": cached_response,
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "model": tool_policy.model,
+                    "routing_tier": tool_policy.tier,
+                    "reasoning_effort": tool_policy.reasoning_effort,
+                    "max_tokens": tool_policy.max_tokens,
+                    "intent_level": tool_policy.effective_level,
+                    "tool_mode": tool_policy.tool_mode,
+                    "enabled_toolsets": enabled_toolsets,
+                    "routing_complexity": tool_policy.complexity,
+                    "cache_hit": True,
+                }
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -9454,7 +9832,7 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            if self._ephemeral_system_prompt:
+            if tool_policy.load_heavy_prompts and self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
@@ -9472,20 +9850,28 @@ class GatewayRunner:
                     session_key=session_key,
                     user_config=user_config,
                 )
+                model = tool_policy.model
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), (session_key or "")[:30],
                 )
             except Exception as exc:
                 return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
-                    "messages": [],
-                    "api_calls": 0,
-                    "tools": [],
-                }
+                        "final_response": f"⚠️ Provider authentication failed: {exc}",
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                        "model": tool_policy.model,
+                        "routing_tier": tool_policy.tier,
+                        "reasoning_effort": tool_policy.reasoning_effort,
+                        "max_tokens": tool_policy.max_tokens,
+                        "intent_level": tool_policy.effective_level,
+                        "tool_mode": tool_policy.tool_mode,
+                        "enabled_toolsets": enabled_toolsets,
+                        }
 
             pr = self._provider_routing
-            reasoning_config = self._load_reasoning_config()
+            reasoning_config = routed_reasoning_config
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             # Set up stream consumer for token streaming or interim commentary.
@@ -9576,6 +9962,10 @@ class GatewayRunner:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            merged_request_overrides = dict(turn_route.get("request_overrides") or {})
+            merged_request_overrides.update(routed_request_overrides)
+            if tool_policy.early_stopping and turn_route["runtime"].get("api_mode") == "chat_completions":
+                merged_request_overrides.setdefault("stop", ["\n\n"])
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -9585,6 +9975,13 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
+                tool_policy.intent,
+                tool_policy.tier,
+                tool_policy.reasoning_effort,
+                tool_policy.tools_enabled,
+                message,
+                tool_policy.max_tokens,
+                merged_request_overrides,
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -9619,10 +10016,11 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     ephemeral_system_prompt=combined_ephemeral or None,
-                    prefill_messages=self._prefill_messages or None,
+                    prefill_messages=(self._prefill_messages or None) if tool_policy.load_heavy_prompts else None,
+                    max_tokens=tool_policy.max_tokens,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
+                    request_overrides=merged_request_overrides,
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),
@@ -9649,9 +10047,12 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
+            agent.prefill_messages = list(self._prefill_messages) if tool_policy.load_heavy_prompts and self._prefill_messages else []
+            agent.max_tokens = tool_policy.max_tokens
+            agent._routing_budget_tokens = tool_policy.budget_tokens
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
-            agent.request_overrides = turn_route.get("request_overrides")
+            agent.request_overrides = merged_request_overrides
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -9936,9 +10337,19 @@ class GatewayRunner:
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            if not _resolved_model:
+                _resolved_model = tool_policy.model
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                used_tools_this_turn = bool(tools_holder[0])
+                self._update_routing_feedback(
+                    session_key=session_key,
+                    user_id=source.user_id,
+                    used_tools=used_tools_this_turn,
+                    failed=True,
+                    routed_tier=tool_policy.tier,
+                )
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -9951,6 +10362,12 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "routing_tier": tool_policy.tier,
+                    "reasoning_effort": tool_policy.reasoning_effort,
+                    "max_tokens": tool_policy.max_tokens,
+                    "intent_level": tool_policy.effective_level,
+                    "tool_mode": tool_policy.tool_mode,
+                    "enabled_toolsets": enabled_toolsets,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -10029,6 +10446,18 @@ class GatewayRunner:
                 except Exception:
                     pass
 
+            if can_use_fast_cache:
+                self._fast_cache_put(message, final_response, fast_cache_key, fast_cache_bucket)
+
+            used_tools_this_turn = bool(tools_holder[0])
+            self._update_routing_feedback(
+                session_key=session_key,
+                user_id=source.user_id,
+                used_tools=used_tools_this_turn,
+                failed=False,
+                routed_tier=tool_policy.tier,
+            )
+
             return {
                 "final_response": final_response,
                 "last_reasoning": result.get("last_reasoning"),
@@ -10042,6 +10471,14 @@ class GatewayRunner:
                 "model": _resolved_model,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
+                "routing_tier": tool_policy.tier,
+                "reasoning_effort": tool_policy.reasoning_effort,
+                "max_tokens": tool_policy.max_tokens,
+                "intent_level": tool_policy.effective_level,
+                "tool_mode": tool_policy.tool_mode,
+                "enabled_toolsets": enabled_toolsets,
+                "routing_complexity": tool_policy.complexity,
+                "cache_hit": False,
             }
         
         # Start progress message sender if enabled

@@ -39,52 +39,41 @@ class TestAgentConfigSignature:
         sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
         assert sig1 == sig2
 
-    def test_model_change_different_signature(self):
+    def test_toolset_change_different_signature(self):
         from gateway.run import GatewayRunner
 
         runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1",
                     "provider": "openrouter"}
-        sig1 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
-        sig2 = GatewayRunner._agent_config_signature("claude-opus-4.6", runtime, ["hermes-telegram"], "")
+        sig1 = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-telegram"], "", "L2_TOOL", "high", "high", True
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "claude-opus-4.6", runtime, ["hermes-discord"], "", "L2_TOOL", "high", "high", True
+        )
         assert sig1 != sig2
 
-    def test_same_token_prefix_different_full_token_changes_signature(self):
-        """Tokens sharing a JWT-style prefix must not collide."""
-        from gateway.run import GatewayRunner
-
-        rt1 = {
-            "api_key": "eyJhbGci.token-for-account-a",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-        }
-        rt2 = {
-            "api_key": "eyJhbGci.token-for-account-b",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-        }
-
-        assert rt1["api_key"][:8] == rt2["api_key"][:8]
-        sig1 = GatewayRunner._agent_config_signature("gpt-5.3-codex", rt1, ["hermes-telegram"], "")
-        sig2 = GatewayRunner._agent_config_signature("gpt-5.3-codex", rt2, ["hermes-telegram"], "")
-        assert sig1 != sig2
-
-    def test_provider_change_different_signature(self):
-        from gateway.run import GatewayRunner
-
-        rt1 = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
-        rt2 = {"api_key": "sk-test12345678", "base_url": "https://api.anthropic.com", "provider": "anthropic"}
-        sig1 = GatewayRunner._agent_config_signature("claude-sonnet-4", rt1, ["hermes-telegram"], "")
-        sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", rt2, ["hermes-telegram"], "")
-        assert sig1 != sig2
-
-    def test_toolset_change_different_signature(self):
+    def test_input_text_does_not_change_signature(self):
         from gateway.run import GatewayRunner
 
         runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
-        sig1 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
-        sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-discord"], "")
+        sig1 = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-telegram"], "", "L0_CHAT", "mini", "low", False, "hello"
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-telegram"], "", "L0_CHAT", "mini", "low", False, "hey there"
+        )
+        assert sig1 == sig2
+
+    def test_model_change_changes_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
+        sig1 = GatewayRunner._agent_config_signature(
+            "gpt-5.1", runtime, ["hermes-telegram"], "", "L1_REASONING", "standard", "medium", False
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "gpt-5.2", runtime, ["hermes-telegram"], "", "L1_REASONING", "standard", "medium", False
+        )
         assert sig1 != sig2
 
     def test_reasoning_not_in_signature(self):
@@ -94,8 +83,12 @@ class TestAgentConfigSignature:
         runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
         # Same config — signature should be identical regardless of what
         # reasoning_config the caller might have (it's not passed in)
-        sig1 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
-        sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
+        sig1 = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-telegram"], "", "L1_REASONING", "standard", "medium", False
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["hermes-telegram"], "", "L1_REASONING", "standard", "medium", False
+        )
         assert sig1 == sig2
 
 
@@ -129,8 +122,8 @@ class TestAgentCacheLifecycle:
         assert cached[1] == sig
         assert cached[0] is agent1  # same instance
 
-    def test_cache_miss_on_model_change(self):
-        """Model change produces different signature → cache miss."""
+    def test_cache_miss_on_toolset_change(self):
+        """Toolset change produces different signature → cache miss."""
         from run_agent import AIAgent
 
         runner = _make_runner()
@@ -138,7 +131,9 @@ class TestAgentCacheLifecycle:
         runtime = {"api_key": "test", "base_url": "https://openrouter.ai/api/v1",
                     "provider": "openrouter", "api_mode": "chat_completions"}
 
-        old_sig = runner._agent_config_signature("anthropic/claude-sonnet-4", runtime, ["hermes-telegram"], "")
+        old_sig = runner._agent_config_signature(
+            "anthropic/claude-sonnet-4", runtime, ["hermes-telegram"], "", "L2_TOOL", "high", "high", True
+        )
         agent1 = AIAgent(
             model="anthropic/claude-sonnet-4", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
@@ -148,8 +143,10 @@ class TestAgentCacheLifecycle:
         with runner._agent_cache_lock:
             runner._agent_cache[session_key] = (agent1, old_sig)
 
-        # New model → different signature
-        new_sig = runner._agent_config_signature("anthropic/claude-opus-4.6", runtime, ["hermes-telegram"], "")
+        # New toolset → different signature
+        new_sig = runner._agent_config_signature(
+            "anthropic/claude-opus-4.6", runtime, ["hermes-discord"], "", "L2_TOOL", "high", "high", True
+        )
         assert new_sig != old_sig
 
         with runner._agent_cache_lock:

@@ -46,6 +46,29 @@ model:
   # api_key: "your-key-here"  # Uncomment to set here instead of .env
   base_url: "https://openrouter.ai/api/v1"
 
+  # Optional gateway routing tiers for GPT-family cost optimization.
+  # When model.default is gpt-5.4 and no explicit /model session override is active,
+  # the gateway now prefers:
+  #   L0 / mini      -> gpt-5.4-mini
+  #   L1 / standard  -> gpt-5.1
+  #   L2 / high      -> gpt-5.2
+  #   L3 / xhigh     -> gpt-5.4
+  #
+  # Uncomment to override any tier explicitly:
+  # l0: "gpt-5.4-mini"
+  # l1: "gpt-5.1"
+  # l2: "gpt-5.2"
+  # l3: "gpt-5.4"
+  #
+  # Or use the routing block for named tier overrides:
+  # routing:
+  #   mini: "gpt-5.4-mini"
+  #   standard: "gpt-5.1"
+  #   high: "gpt-5.2"
+  #   xhigh: "gpt-5.4"
+  #   # Example if you intentionally want Codex on tool-heavy turns:
+  #   # high: "gpt-5.3-codex"
+
   # ── Token limits — two settings, easy to confuse ──────────────────────────
   #
   # context_length: TOTAL context window (input + output tokens combined).

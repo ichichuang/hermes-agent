@@ -126,7 +126,6 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-<<<<<<< HEAD
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 from core.output.sanitizer import sanitize_assistant_message, sanitize_assistant_text
 

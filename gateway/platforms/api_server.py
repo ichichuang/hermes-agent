@@ -29,6 +29,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -46,6 +47,13 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from hermes_constants import get_hermes_home
+
+_hermes_home = get_hermes_home()
+if str(_hermes_home) not in sys.path:
+    sys.path.insert(0, str(_hermes_home))
+
+from core.output.sanitizer import assert_sanitized_assistant_output, sanitize_assistant_text
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +65,34 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+
+def _sanitize_outbound_assistant_text(text: Any) -> str:
+    cleaned, _ = _assert_outbound_assistant_text(text)
+    return cleaned
+
+
+def _assert_outbound_assistant_text(text: Any) -> tuple[str, bool]:
+    if text is None:
+        return "", False
+    original = str(text)
+    assertion = assert_sanitized_assistant_output(original)
+    cleaned = str(assertion.cleaned or "")
+    if not cleaned:
+        return cleaned, assertion.violated
+    leading = re.match(r"^\s+", original)
+    trailing = re.search(r"\s+$", original)
+    if leading and not cleaned.startswith(leading.group(0)):
+        cleaned = leading.group(0) + cleaned
+    if trailing and not cleaned.endswith(trailing.group(0)):
+        cleaned = cleaned + trailing.group(0)
+    return cleaned, assertion.violated
+
+
+def _attach_sanitizer_warning(payload: Dict[str, Any]) -> None:
+    meta = payload.setdefault("_hermes", {})
+    if isinstance(meta, dict):
+        meta["sanitizer_warning"] = True
 
 
 def _normalize_chat_content(
@@ -1007,7 +1043,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = result.get("final_response", "")
+        final_response, sanitizer_warning = _assert_outbound_assistant_text(result.get("final_response", ""))
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
@@ -1033,7 +1069,13 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        headers = {"X-Hermes-Session-Id": session_id}
+        if sanitizer_warning:
+            logger.error("Sanitizer violation detected in chat completion response; stripping again.")
+            _attach_sanitizer_warning(response_data)
+            headers["X-Hermes-Sanitizer-Warning"] = "1"
+
+        return web.json_response(response_data, headers=headers)
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -1065,6 +1107,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            stream_warning = False
 
             # Role chunk
             role_chunk = {
@@ -1077,6 +1120,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
+                nonlocal stream_warning
                 """Write a single queue item to the SSE stream.
 
                 Plain strings are sent as normal ``delta.content`` chunks.
@@ -1091,10 +1135,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    chunk_text, chunk_warning = _assert_outbound_assistant_text(item)
+                    if chunk_warning:
+                        stream_warning = True
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": chunk_text}, "finish_reason": None}],
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
@@ -1145,6 +1192,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            if stream_warning:
+                logger.error("Sanitizer violation detected in streaming chat completion; stripping again.")
+                finish_chunk["x_hermes_sanitizer_warning"] = True
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -1269,6 +1319,7 @@ class APIServerAdapter(BasePlatformAdapter):
         final_response_text = ""
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        stream_warning = False
 
         try:
             # response.created — initial envelope, status=in_progress
@@ -1303,6 +1354,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                nonlocal stream_warning
+                delta_text, delta_warning = _assert_outbound_assistant_text(delta_text)
+                if delta_warning:
+                    stream_warning = True
+                if not delta_text:
+                    return
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -1475,7 +1532,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
                 # delta so Responses clients still receive a live text part.
-                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                agent_final = (
+                    _assert_outbound_assistant_text(result.get("final_response", ""))[0]
+                    if isinstance(result, dict)
+                    else ""
+                )
                 if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
@@ -1487,16 +1548,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_error = str(e)
 
             # Close the message item if it was opened
-            final_response_text = "".join(final_text_parts) or final_response_text
+            final_response_text, final_warning = _assert_outbound_assistant_text(
+                "".join(final_text_parts) or final_response_text
+            )
+            stream_warning = stream_warning or final_warning
             if message_opened:
-                await _write_event("response.output_text.done", {
+                text_done_event = {
                     "type": "response.output_text.done",
                     "item_id": message_item_id,
                     "output_index": message_output_index,
                     "content_index": 0,
                     "text": final_response_text,
                     "logprobs": [],
-                })
+                }
+                if stream_warning:
+                    text_done_event["x_hermes_sanitizer_warning"] = True
+                await _write_event("response.output_text.done", text_done_event)
                 msg_done_item = {
                     "id": message_item_id,
                     "type": "message",
@@ -1506,6 +1573,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"type": "output_text", "text": final_response_text}
                     ],
                 }
+                if stream_warning:
+                    msg_done_item["_hermes"] = {"sanitizer_warning": True}
                 await _write_event("response.output_item.done", {
                     "type": "response.output_item.done",
                     "output_index": message_output_index,
@@ -1524,6 +1593,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     {"type": "output_text", "text": final_response_text or (agent_error or "")}
                 ],
             })
+            if stream_warning:
+                final_items[-1]["_hermes"] = {"sanitizer_warning": True}
 
             if agent_error:
                 failed_env = _envelope("failed")
@@ -1546,6 +1617,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                if stream_warning:
+                    logger.error("Sanitizer violation detected in streaming responses completion; stripping again.")
+                    _attach_sanitizer_warning(completed_env)
                 await _write_event("response.completed", {
                     "type": "response.completed",
                     "response": completed_env,
@@ -1799,7 +1873,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = result.get("final_response", "")
+        final_response, sanitizer_warning = _assert_outbound_assistant_text(result.get("final_response", ""))
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
@@ -1833,6 +1907,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        if sanitizer_warning:
+            logger.error("Sanitizer violation detected in responses API final output; stripping again.")
+            _attach_sanitizer_warning(response_data)
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -2138,7 +2215,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         # Final assistant message
-        final = result.get("final_response", "")
+        final, sanitizer_warning = _assert_outbound_assistant_text(result.get("final_response", ""))
         if not final:
             final = result.get("error", "(No response generated)")
 
@@ -2152,6 +2229,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             ],
         })
+        if sanitizer_warning:
+            items[-1]["_hermes"] = {"sanitizer_warning": True}
         return items
 
     # ------------------------------------------------------------------
@@ -2376,13 +2455,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                final_response, sanitizer_warning = _assert_outbound_assistant_text(
+                    result.get("final_response", "") if isinstance(result, dict) else ""
+                )
+                if sanitizer_warning:
+                    logger.error("Sanitizer violation detected in run.completed output; stripping again.")
                 q.put_nowait({
                     "event": "run.completed",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "output": final_response,
                     "usage": usage,
+                    "_hermes": {"sanitizer_warning": True} if sanitizer_warning else {},
                 })
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)

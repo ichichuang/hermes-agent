@@ -92,7 +92,11 @@ from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 if str(_hermes_home) not in sys.path:
     sys.path.insert(0, str(_hermes_home))
-from core.output.sanitizer import sanitize_assistant_message, sanitize_assistant_text
+from core.output.sanitizer import (
+    assert_sanitized_assistant_output,
+    sanitize_assistant_message,
+    sanitize_assistant_text,
+)
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -9383,6 +9387,25 @@ class GatewayRunner:
 
     # ------------------------------------------------------------------
 
+    async def _deliver_gateway_message(
+        self,
+        adapter,
+        chat_id: str,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ):
+        assertion = assert_sanitized_assistant_output(content)
+        content = assertion.cleaned
+        if assertion.violated:
+            adapter_name = getattr(adapter, "name", adapter.__class__.__name__)
+            logger.error("[%s] Sanitizer violation detected on final gateway delivery; stripping again.", adapter_name)
+            metadata = dict(metadata or {})
+            metadata["_hermes_sanitizer_warning"] = assertion.warning
+        if not str(content or "").strip():
+            return None
+        return await adapter.send(chat_id, content, metadata=metadata)
+
     async def _run_agent(
         self,
         message: str,
@@ -9887,7 +9910,8 @@ class GatewayRunner:
                     return
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        _status_adapter.send(
+                        self._deliver_gateway_message(
+                            _status_adapter,
                             _status_chat_id,
                             text,
                             metadata=_status_thread_metadata,
@@ -10806,7 +10830,8 @@ class GatewayRunner:
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key[:20] if session_key else "?",
                             )
-                            await adapter.send(
+                            await self._deliver_gateway_message(
+                                adapter,
                                 source.chat_id,
                                 first_response,
                                 metadata=_status_thread_metadata,

@@ -5345,6 +5345,21 @@ class AIAgent:
             return ""
         return re.sub(r"\s+", " ", text).strip()
 
+    @staticmethod
+    def _sanitize_stream_visible_text(text: str) -> str:
+        if not isinstance(text, str):
+            return sanitize_assistant_text(text)
+        cleaned = sanitize_assistant_text(text)
+        if not isinstance(cleaned, str) or not cleaned:
+            return cleaned
+        leading = re.match(r"^\s+", text)
+        trailing = re.search(r"\s+$", text)
+        if leading and not cleaned.startswith(leading.group(0)):
+            cleaned = leading.group(0) + cleaned
+        if trailing and not cleaned.endswith(trailing.group(0)):
+            cleaned = cleaned + trailing.group(0)
+        return cleaned
+
     def _interim_content_was_streamed(self, content: str) -> bool:
         visible_content = self._normalize_interim_visible_text(
             self._strip_think_blocks(content or "")
@@ -5362,7 +5377,7 @@ class AIAgent:
         if cb is None or not isinstance(assistant_msg, dict):
             return
         content = assistant_msg.get("content")
-        visible = self._strip_think_blocks(content or "").strip()
+        visible = sanitize_assistant_text(self._strip_think_blocks(content or "")).strip()
         if not visible or visible == "(empty)":
             return
         already_streamed = self._interim_content_was_streamed(visible)
@@ -5373,6 +5388,9 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        text = self._sanitize_stream_visible_text(text)
+        if not text:
+            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking

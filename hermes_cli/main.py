@@ -6839,6 +6839,11 @@ For more help on a command:
         action="store_true",
         help="Replace any existing gateway instance (useful for systemd)",
     )
+    gateway_run.add_argument(
+        "--feishu-probe",
+        action="store_true",
+        help="Send a real sanitized Feishu probe message and exit (requires ENABLE_EXTERNAL_PROBES=true).",
+    )
     _add_accept_hooks_flag(gateway_run)
     _add_accept_hooks_flag(gateway_parser)
 

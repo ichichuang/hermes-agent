@@ -1043,8 +1043,8 @@ class TestLastPromptTokens:
         store.update_session("k1", last_prompt_tokens=0)
         assert entry.last_prompt_tokens == 0
 
-class TestRewriteTranscriptPreservesReasoning:
-    """rewrite_transcript must not drop reasoning fields from SQLite."""
+class TestRewriteTranscriptSanitizesAssistantInternals:
+    """rewrite_transcript must strip assistant reasoning/tool internals."""
 
     def test_reasoning_survives_rewrite(self, tmp_path):
         from hermes_state import SessionDB
@@ -1053,23 +1053,26 @@ class TestRewriteTranscriptPreservesReasoning:
         session_id = "reasoning-test"
         db.create_session(session_id=session_id, source="cli")
 
-        # Insert a message WITH all three reasoning fields
+        # Insert a message with internal assistant fields to verify cleanup.
         db.append_message(
             session_id=session_id,
             role="assistant",
-            content="The answer is 42.",
+            content='The answer is 42.\nto=functions.exec_command {"secret":"nope"}\n"finish_reason": "tool_calls"',
             reasoning="I need to think step by step.",
             reasoning_content="provider scratchpad",
             reasoning_details=[{"type": "summary", "text": "step by step"}],
             codex_reasoning_items=[{"id": "r1", "type": "reasoning"}],
+            finish_reason="tool_calls",
+            tool_calls=[{"id": "call_1", "function": {"name": "secret_tool", "arguments": "{}"}}],
         )
 
-        # Verify all three were stored
+        # Verify the historical row contains the internal fields before rewrite.
         before = db.get_messages_as_conversation(session_id)
         assert before[0].get("reasoning") == "I need to think step by step."
         assert before[0].get("reasoning_content") == "provider scratchpad"
         assert before[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
         assert before[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+        assert before[0].get("tool_calls")
 
         # Now simulate /retry: build the SessionStore and call rewrite_transcript
         config = GatewayConfig()
@@ -1081,9 +1084,12 @@ class TestRewriteTranscriptPreservesReasoning:
         # rewrite_transcript receives the messages that load_transcript returned
         store.rewrite_transcript(session_id, before)
 
-        # Load again — all three reasoning fields must survive
+        # Load again — assistant internals must be stripped during rewrite.
         after = db.get_messages_as_conversation(session_id)
-        assert after[0].get("reasoning") == "I need to think step by step."
-        assert after[0].get("reasoning_content") == "provider scratchpad"
-        assert after[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
-        assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+        assert after[0].get("reasoning") is None
+        assert after[0].get("reasoning_content") is None
+        assert after[0].get("reasoning_details") is None
+        assert after[0].get("codex_reasoning_items") is None
+        assert after[0].get("finish_reason") is None
+        assert after[0].get("tool_calls") is None
+        assert "to=functions.exec_command" not in (after[0].get("content") or "")

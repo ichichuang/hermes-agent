@@ -18,12 +18,17 @@ suppress delivery.
 """
 
 import logging
+import sys
 import threading
 
 logger = logging.getLogger("hooks.boot-md")
 
 from hermes_constants import get_hermes_home
 HERMES_HOME = get_hermes_home()
+if str(HERMES_HOME) not in sys.path:
+    sys.path.insert(0, str(HERMES_HOME))
+
+from core.output.sanitizer import sanitize_assistant_text
 BOOT_FILE = HERMES_HOME / "BOOT.md"
 
 
@@ -55,7 +60,7 @@ def _run_boot_agent(content: str) -> None:
             max_iterations=20,
         )
         result = agent.run_conversation(prompt)
-        response = result.get("final_response", "")
+        response = sanitize_assistant_text(result.get("final_response", ""))
         if response and "[SILENT]" not in response:
             logger.info("boot-md completed: %s", response[:200])
         else:

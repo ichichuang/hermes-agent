@@ -12,12 +12,21 @@ import hashlib
 import logging
 import os
 import json
+import sys
 import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
+
+from hermes_constants import get_hermes_home
+
+_hermes_home = get_hermes_home()
+if str(_hermes_home) not in sys.path:
+    sys.path.insert(0, str(_hermes_home))
+
+from core.output.sanitizer import sanitize_assistant_message
 
 logger = logging.getLogger(__name__)
 
@@ -1127,6 +1136,14 @@ class SessionStore:
     def get_transcript_path(self, session_id: str) -> Path:
         """Get the path to a session's legacy transcript file."""
         return self.sessions_dir / f"{session_id}.jsonl"
+
+    @staticmethod
+    def _sanitize_transcript_message(message: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(message, dict):
+            return message
+        if message.get("role") != "assistant":
+            return dict(message)
+        return sanitize_assistant_message(message)
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Append a message to a session's transcript (SQLite + legacy JSONL).
@@ -1137,6 +1154,8 @@ class SessionStore:
                      via its own _flush_messages_to_session_db(), preventing
                      the duplicate-write bug (#860).
         """
+        message = self._sanitize_transcript_message(message)
+
         # Write to SQLite (unless the agent already handled it)
         if self._db and not skip_db:
             try:
@@ -1170,7 +1189,8 @@ class SessionStore:
         if self._db:
             try:
                 self._db.clear_messages(session_id)
-                for msg in messages:
+                for raw_msg in messages:
+                    msg = self._sanitize_transcript_message(raw_msg)
                     role = msg.get("role", "unknown")
                     self._db.append_message(
                         session_id=session_id,
@@ -1190,7 +1210,8 @@ class SessionStore:
         # JSONL: overwrite the file
         transcript_path = self.get_transcript_path(session_id)
         with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
+            for raw_msg in messages:
+                msg = self._sanitize_transcript_message(raw_msg)
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:

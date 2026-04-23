@@ -33,6 +33,7 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "show_reasoning": False,
+    "interim_assistant_messages": True,
     "tool_preview_length": 0,
     "streaming": None,  # None = follow top-level streaming config
 }
@@ -48,6 +49,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
 _TIER_HIGH = {
     "tool_progress": "all",
     "show_reasoning": False,
+    "interim_assistant_messages": True,
     "tool_preview_length": 40,
     "streaming": None,  # follow global
 }
@@ -55,6 +57,7 @@ _TIER_HIGH = {
 _TIER_MEDIUM = {
     "tool_progress": "new",
     "show_reasoning": False,
+    "interim_assistant_messages": True,
     "tool_preview_length": 40,
     "streaming": None,
 }
@@ -62,6 +65,7 @@ _TIER_MEDIUM = {
 _TIER_LOW = {
     "tool_progress": "off",
     "show_reasoning": False,
+    "interim_assistant_messages": True,
     "tool_preview_length": 40,
     "streaming": False,
 }
@@ -69,6 +73,7 @@ _TIER_LOW = {
 _TIER_MINIMAL = {
     "tool_progress": "off",
     "show_reasoning": False,
+    "interim_assistant_messages": False,
     "tool_preview_length": 0,
     "streaming": False,
 }
@@ -182,7 +187,7 @@ def _normalise(setting: str, value: Any) -> Any:
         if value is True:
             return "all"
         return str(value).lower()
-    if setting in ("show_reasoning", "streaming"):
+    if setting in ("show_reasoning", "streaming", "interim_assistant_messages"):
         if isinstance(value, str):
             return value.lower() in ("true", "1", "yes", "on")
         return bool(value)

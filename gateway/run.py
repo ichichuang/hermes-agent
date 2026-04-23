@@ -90,6 +90,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
+if str(_hermes_home) not in sys.path:
+    sys.path.insert(0, str(_hermes_home))
+from core.output.sanitizer import sanitize_assistant_message, sanitize_assistant_text
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -3617,6 +3620,12 @@ class GatewayRunner:
         if canonical == "background":
             return await self._handle_background_command(event)
 
+        if canonical == "exec":
+            return await self._handle_exec_command(event)
+
+        if canonical == "gh":
+            return await self._handle_gh_command(event)
+
         if canonical == "btw":
             return await self._handle_btw_command(event)
 
@@ -4461,7 +4470,7 @@ class GatewayRunner:
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
-            response = agent_result.get("final_response") or ""
+            response = sanitize_assistant_text(agent_result.get("final_response") or "")
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -4603,10 +4612,10 @@ class GatewayRunner:
             # old post-loop pop_pending + approval_hint code was removed in favour
             # of the blocking approach that mirrors CLI's synchronous input().
             
-            # Save the full conversation to the transcript, including tool calls.
-            # This preserves the complete agent loop (tool_calls, tool results,
-            # intermediate reasoning) so sessions can be resumed with full context
-            # and transcripts are useful for debugging and training data.
+            # Save the full conversation to the transcript using sanitized
+            # assistant messages. Tool and system records remain available for
+            # resume/debugging, but assistant reasoning and raw tool payloads are
+            # stripped before persistence and delivery.
             #
             # IMPORTANT: When the agent failed (e.g. context-overflow 400,
             # compression exhausted), do NOT persist the user's message.
@@ -6416,6 +6425,220 @@ class GatewayRunner:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
+    @staticmethod
+    def _parse_direct_exec_args(raw_args: str) -> dict[str, Any]:
+        """Parse gateway-side direct execution flags.
+
+        Supported syntax:
+          /exec <command>
+          /exec [flags] -- <command>
+          /gh <gh args>
+          /gh [flags] -- <gh args>
+
+        When flags are used, they must appear before ``--`` so the remaining
+        payload is preserved verbatim for the shell.
+        """
+        raw_args = str(raw_args or "").strip()
+        if not raw_args:
+            raise ValueError("missing command")
+
+        options = {
+            "background": False,
+            "notify_on_complete": False,
+            "pty": False,
+            "timeout": None,
+            "workdir": None,
+            "command": "",
+        }
+
+        if not raw_args.startswith("-"):
+            options["command"] = raw_args
+            return options
+
+        separator = re.search(r"(^|\s)--(?:\s|$)", raw_args)
+        if not separator:
+            options["command"] = raw_args
+            return options
+
+        flag_part = raw_args[: separator.start()].strip()
+        command_part = raw_args[separator.end() :].strip()
+        command = command_part.strip()
+        if not command:
+            raise ValueError("missing command after --")
+
+        try:
+            flag_tokens = shlex.split(flag_part)
+        except ValueError as exc:
+            raise ValueError(f"invalid flags: {exc}") from exc
+
+        idx = 0
+        while idx < len(flag_tokens):
+            token = flag_tokens[idx]
+            if token in ("--background", "-b"):
+                options["background"] = True
+            elif token in ("--notify", "-n"):
+                options["notify_on_complete"] = True
+            elif token == "--pty":
+                options["pty"] = True
+            elif token in ("--timeout", "-t"):
+                idx += 1
+                if idx >= len(flag_tokens):
+                    raise ValueError("--timeout requires an integer value")
+                try:
+                    options["timeout"] = int(flag_tokens[idx])
+                except ValueError as exc:
+                    raise ValueError("--timeout must be an integer") from exc
+            elif token in ("--workdir", "-C"):
+                idx += 1
+                if idx >= len(flag_tokens):
+                    raise ValueError("--workdir requires a path")
+                options["workdir"] = flag_tokens[idx]
+            elif token:
+                raise ValueError(f"unknown flag: {token}")
+            idx += 1
+
+        options["command"] = command
+        return options
+
+    @staticmethod
+    def _format_direct_exec_usage(command_name: str) -> str:
+        if command_name == "gh":
+            return (
+                "Usage: /gh <gh args>\n"
+                "Usage: /gh [--background] [--notify] [--timeout N] [--workdir PATH] -- <gh args>\n"
+                "Examples:\n"
+                "/gh repo view\n"
+                "/gh --workdir /Users/cc/.hermes -- pr status"
+            )
+        return (
+            "Usage: /exec <command>\n"
+            "Usage: /exec [--background] [--notify] [--pty] [--timeout N] [--workdir PATH] -- <command>\n"
+            "Examples:\n"
+            "/exec git status\n"
+            "/exec --workdir /Users/cc/.hermes -- git add -A\n"
+            "/exec --background --notify -- python3 ~/.hermes/scripts/auto_safe_upgrade.py upgrade"
+        )
+
+    @staticmethod
+    def _render_direct_exec_result(command_label: str, result: dict[str, Any]) -> str:
+        max_chars = 12_000
+        status = str(result.get("status") or "").strip().lower()
+        output = str(result.get("output") or "").strip()
+        error = str(result.get("error") or "").strip()
+        approval = str(result.get("approval") or "").strip()
+        pty_note = str(result.get("pty_note") or "").strip()
+        exit_code = result.get("exit_code")
+        session_id = str(result.get("session_id") or "").strip()
+
+        lines: list[str] = []
+        if session_id:
+            lines.append(f"🔄 Started `{command_label}` in background.")
+            lines.append(f"Session ID: `{session_id}`")
+            if result.get("notify_on_complete"):
+                lines.append("Completion notification: enabled")
+            if approval:
+                lines.append(approval)
+            if pty_note:
+                lines.append(pty_note)
+            return "\n".join(lines)
+
+        headline = "✅ Command completed."
+        if status in {"blocked", "approval_required"}:
+            headline = "⛔ Command blocked."
+        elif exit_code not in (0, None):
+            headline = f"❌ Command failed (exit {exit_code})."
+        elif error and not output:
+            headline = "⚠️ Command returned an error."
+
+        lines.append(headline)
+        lines.append(f"Command: `{command_label}`")
+
+        body_parts: list[str] = []
+        if output:
+            body_parts.append(output)
+        if error:
+            body_parts.append(error)
+        if approval:
+            body_parts.append(approval)
+        if pty_note:
+            body_parts.append(pty_note)
+
+        if body_parts:
+            body = "\n\n".join(body_parts)
+            if len(body) > max_chars:
+                body = body[: max_chars - 3] + "..."
+            lines.append("")
+            lines.append("```text")
+            lines.append(body)
+            lines.append("```")
+
+        return "\n".join(lines)
+
+    async def _run_direct_terminal_command(
+        self,
+        *,
+        command_name: str,
+        raw_args: str,
+        command_prefix: str = "",
+    ) -> str:
+        """Execute a direct gateway-side shell command without the full agent loop."""
+        raw_args = str(raw_args or "")
+        if not raw_args.strip():
+            return self._format_direct_exec_usage(command_name)
+
+        try:
+            parsed = self._parse_direct_exec_args(raw_args)
+        except ValueError as exc:
+            return f"{self._format_direct_exec_usage(command_name)}\n\nError: {exc}"
+
+        command = parsed["command"]
+        if command_prefix:
+            command = f"{command_prefix} {command}".strip()
+
+        from tools.terminal_tool import terminal_tool
+
+        def run_sync() -> str:
+            return terminal_tool(
+                command=command,
+                background=bool(parsed["background"]),
+                timeout=parsed["timeout"],
+                workdir=parsed["workdir"],
+                pty=bool(parsed["pty"]),
+                notify_on_complete=bool(parsed["notify_on_complete"]),
+            )
+
+        try:
+            raw_result = await self._run_in_executor_with_context(run_sync)
+        except Exception as exc:
+            logger.exception("Direct gateway execution failed for %s", command_name)
+            return f"❌ Failed to execute `{command_name}`: {exc}"
+
+        try:
+            result = json.loads(raw_result or "{}")
+        except json.JSONDecodeError:
+            logger.warning("Direct gateway execution returned non-JSON payload: %r", raw_result)
+            result = {
+                "output": str(raw_result or "").strip(),
+                "exit_code": 0,
+            }
+
+        return self._render_direct_exec_result(command, result)
+
+    async def _handle_exec_command(self, event: MessageEvent) -> str:
+        """Handle /exec — direct shell execution on the gateway host."""
+        return await self._run_direct_terminal_command(
+            command_name="exec",
+            raw_args=event.get_command_args(),
+        )
+
+    async def _handle_gh_command(self, event: MessageEvent) -> str:
+        """Handle /gh — direct GitHub CLI execution on the gateway host."""
+        return await self._run_direct_terminal_command(
+            command_name="gh",
+            raw_args=event.get_command_args(),
+            command_prefix="gh",
+        )
+
     async def _run_background_task(
         self, prompt: str, source: "SessionSource", task_id: str
     ) -> None:
@@ -7232,15 +7455,20 @@ class GatewayRunner:
         # Copy conversation history to the new session
         for msg in history:
             try:
+                sanitized = (
+                    sanitize_assistant_message(msg)
+                    if msg.get("role") == "assistant"
+                    else msg
+                )
                 self._session_db.append_message(
                     session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    reasoning=msg.get("reasoning"),
-                    reasoning_content=msg.get("reasoning_content"),
+                    role=sanitized.get("role", "user"),
+                    content=sanitized.get("content"),
+                    tool_name=sanitized.get("tool_name") or sanitized.get("name"),
+                    tool_calls=sanitized.get("tool_calls"),
+                    tool_call_id=sanitized.get("tool_call_id"),
+                    reasoning=sanitized.get("reasoning"),
+                    reasoning_content=sanitized.get("reasoning_content"),
                 )
             except Exception:
                 pass  # Best-effort copy
@@ -9240,9 +9468,11 @@ class GatewayRunner:
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
-            and is_truthy_value(
-                display_config.get("interim_assistant_messages"),
-                default=True,
+            and resolve_display_setting(
+                user_config,
+                platform_key,
+                "interim_assistant_messages",
+                True,
             )
         )
         
@@ -9646,6 +9876,7 @@ class GatewayRunner:
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                text = sanitize_assistant_text(text)
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -10083,6 +10314,7 @@ class GatewayRunner:
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+            final_response = sanitize_assistant_text(final_response)
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
@@ -10567,7 +10799,7 @@ class GatewayRunner:
                         (_sc and getattr(_sc, "final_response_sent", False))
                         or _previewed
                     )
-                    first_response = result.get("final_response", "")
+                    first_response = sanitize_assistant_text(result.get("final_response", ""))
                     if first_response and not _already_streamed:
                         try:
                             logger.info(

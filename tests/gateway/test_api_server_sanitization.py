@@ -5,11 +5,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import (
-    APIServerAdapter,
-    cors_middleware,
-    security_headers_middleware,
-)
+from gateway.platforms.api_server import APIServerAdapter, cors_middleware, security_headers_middleware
 
 
 def _make_adapter() -> APIServerAdapter:
@@ -19,7 +15,7 @@ def _make_adapter() -> APIServerAdapter:
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
-    app["api_server_adapter"] = adapter
+    app._state["api_server_adapter"] = adapter
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     return app

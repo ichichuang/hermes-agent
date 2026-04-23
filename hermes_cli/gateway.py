@@ -1973,9 +1973,26 @@ def launchd_status(deep: bool = False):
 # Gateway Runner
 # =============================================================================
 
-async def _run_feishu_probe() -> int:
+def _build_feishu_probe_payloads(home_channel: str) -> tuple[str, str, dict[str, object]]:
+    from core.output.sanitizer import assert_sanitized_assistant_output
+
+    raw_payload = 'Hermes Feishu probe\nto=functions.exec_command {"cmd":"whoami"}\n"reasoning": "hidden"'
+    assertion = assert_sanitized_assistant_output(raw_payload)
+    sanitized_payload = str(assertion.cleaned or "")
+    final_payload = {
+        "chat_id": home_channel,
+        "content": sanitized_payload,
+        "metadata": {"probe": "feishu", "bypass_tools": True},
+    }
+    return raw_payload, sanitized_payload, final_payload
+
+
+async def _run_feishu_probe(*, confirm: bool = False, dry_run: bool = False) -> int:
     if os.getenv("ENABLE_EXTERNAL_PROBES", "").strip().lower() != "true":
         print_error("Feishu probe blocked. Set ENABLE_EXTERNAL_PROBES=true to allow external validation.")
+        return 1
+    if not dry_run and not confirm:
+        print_error("Feishu probe blocked. Re-run with --feishu-probe-confirm.")
         return 1
 
     from gateway.config import Platform, load_gateway_config
@@ -1985,7 +2002,6 @@ async def _run_feishu_probe() -> int:
     hermes_home = get_hermes_home()
     if str(hermes_home) not in sys.path:
         sys.path.insert(0, str(hermes_home))
-    from core.output.sanitizer import assert_sanitized_assistant_output
 
     config = load_gateway_config()
     feishu_config = config.platforms.get(Platform.FEISHU)
@@ -1997,11 +2013,16 @@ async def _run_feishu_probe() -> int:
         print_error("Feishu probe failed: FEISHU_HOME_CHANNEL is required.")
         return 1
 
-    raw_payload = 'Hermes Feishu probe\nto=functions.exec_command {"cmd":"whoami"}\n"reasoning": "hidden"'
-    assertion = assert_sanitized_assistant_output(raw_payload)
-    sanitized_payload = str(assertion.cleaned or "")
+    raw_payload, sanitized_payload, final_payload = _build_feishu_probe_payloads(home_channel)
     print_info(f"Feishu probe payload before send: {json.dumps(raw_payload, ensure_ascii=False)}")
     print_info(f"Feishu probe payload after sanitizer: {json.dumps(sanitized_payload, ensure_ascii=False)}")
+    print_info(f"Feishu probe final payload: {json.dumps(final_payload, ensure_ascii=False)}")
+
+    if dry_run:
+        print_warning("Feishu probe dry-run complete. No network call was made.")
+        return 0
+
+    print_warning("External messaging will occur")
 
     adapter = FeishuAdapter(feishu_config)
     connected = await adapter.connect()
@@ -2010,9 +2031,9 @@ async def _run_feishu_probe() -> int:
         return 1
     try:
         result = await adapter.send(
-            home_channel,
-            sanitized_payload,
-            metadata={"probe": "feishu", "bypass_tools": True},
+            final_payload["chat_id"],
+            final_payload["content"],
+            metadata=final_payload["metadata"],
         )
         print_info(
             "Feishu probe adapter output: "
@@ -2030,7 +2051,14 @@ async def _run_feishu_probe() -> int:
         await adapter.disconnect()
 
 
-def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, feishu_probe: bool = False):
+def run_gateway(
+    verbose: int = 0,
+    quiet: bool = False,
+    replace: bool = False,
+    feishu_probe: bool = False,
+    feishu_probe_confirm: bool = False,
+    feishu_probe_dry_run: bool = False,
+):
     """Run the gateway in foreground.
     
     Args:
@@ -2044,8 +2072,15 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fe
     
     from gateway.run import start_gateway
 
-    if feishu_probe:
-        raise SystemExit(asyncio.run(_run_feishu_probe()))
+    if feishu_probe or feishu_probe_dry_run:
+        raise SystemExit(
+            asyncio.run(
+                _run_feishu_probe(
+                    confirm=feishu_probe_confirm,
+                    dry_run=feishu_probe_dry_run,
+                )
+            )
+        )
     
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
@@ -3568,7 +3603,16 @@ def gateway_command(args):
         quiet = getattr(args, 'quiet', False)
         replace = getattr(args, 'replace', False)
         feishu_probe = getattr(args, 'feishu_probe', False)
-        run_gateway(verbose, quiet=quiet, replace=replace, feishu_probe=feishu_probe)
+        feishu_probe_confirm = getattr(args, 'feishu_probe_confirm', False)
+        feishu_probe_dry_run = getattr(args, 'feishu_probe_dry_run', False)
+        run_gateway(
+            verbose,
+            quiet=quiet,
+            replace=replace,
+            feishu_probe=feishu_probe,
+            feishu_probe_confirm=feishu_probe_confirm,
+            feishu_probe_dry_run=feishu_probe_dry_run,
+        )
         return
 
     if subcmd == "setup":

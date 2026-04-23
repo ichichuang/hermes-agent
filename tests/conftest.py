@@ -25,6 +25,7 @@ import re
 import signal
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,43 +37,130 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-_BASELINE_UNSTABLE_TEST_FILES = {
-    "tests/agent/test_minimax_provider.py",
-    "tests/gateway/test_approve_deny_commands.py",
-    "tests/gateway/test_agent_cache.py",
-    "tests/gateway/test_discord_allowed_mentions.py",
-    "tests/gateway/test_discord_connect.py",
-    "tests/gateway/test_discord_reply_mode.py",
-    "tests/gateway/test_discord_send.py",
-    "tests/gateway/test_discord_slash_commands.py",
-    "tests/gateway/test_dm_topics.py",
-    "tests/gateway/test_matrix.py",
-    "tests/gateway/test_send_image_file.py",
-    "tests/hermes_cli/test_gateway_wsl.py",
-    "tests/hermes_cli/test_tips.py",
-    "tests/run_agent/test_concurrent_interrupt.py",
-    "tests/run_agent/test_flush_memories_codex.py",
-    "tests/run_agent/test_real_interrupt_subagent.py",
-    "tests/tools/test_approval.py",
-    "tests/tools/test_approval_heartbeat.py",
-    "tests/tools/test_browser_camofox.py",
-    "tests/tools/test_code_execution_modes.py",
-    "tests/tools/test_file_staleness.py",
-    "tests/tools/test_file_state_registry.py",
-    "tests/tools/test_resolve_path.py",
-    "tests/tools/test_write_deny.py",
-    "tests/tools/test_zombie_process_cleanup.py",
-}
+collect_ignore_glob = ["tests/_legacy_skipped/*"]
+
+_APPROVED_SKIP_RULES = (
+    {
+        "category": "environment_dependent",
+        "path": re.compile(r"^tests/"),
+        "reason": re.compile(
+            r"(not installed|not importable|not available|not configured|not set|required|"
+            r"not found|not running from a git checkout|live-only|no network|unreachable|"
+            r"case-insensitive|Symlinks|Windows|win32|POSIX-only|filesystem is case-insensitive|"
+            r"mock, not the real package|PyNaCl required|SDK 1\.26\.0\+ required|"
+            r"tools\..* not available|atroposlib not installed|MCP SDK)",
+            re.IGNORECASE,
+        ),
+    },
+)
+
+_STRICT_PRODUCTION_INCLUDE_PATTERNS = (
+    re.compile(r"^tests/gateway/test_api_server_sanitization\.py$"),
+    re.compile(r"^tests/gateway/test_output_sanitization\.py$"),
+    re.compile(r"^tests/gateway/test_session\.py$"),
+    re.compile(r"^tests/gateway/test_display_config\.py$"),
+    re.compile(r"^tests/hermes_cli/test_feishu_probe\.py$"),
+)
+
+_STRICT_PRODUCTION_CONFIG: pytest.Config | None = None
+_STRICT_PRODUCTION_VIOLATIONS: list[dict[str, str]] = []
+
+
+def _rel_path(path: str | Path) -> str:
+    try:
+        return Path(path).resolve().relative_to(PROJECT_ROOT).as_posix()
+    except Exception:
+        return str(path)
+
+
+def _skip_reason(longrepr) -> tuple[str, str]:
+    if isinstance(longrepr, tuple) and len(longrepr) >= 3:
+        path, _lineno, reason = longrepr[:3]
+        return _rel_path(path), str(reason)
+    return "<collection>", str(longrepr)
+
+
+def _approved_skip(rel_path: str, reason: str) -> bool:
+    return any(rule["path"].search(rel_path) and rule["reason"].search(reason) for rule in _APPROVED_SKIP_RULES)
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--strict-production",
+        action="store_true",
+        default=False,
+        help="Fail on unapproved skips and treat warnings as errors.",
+    )
+
+
+def pytest_configure(config):
+    global _STRICT_PRODUCTION_CONFIG, _STRICT_PRODUCTION_VIOLATIONS
+    if config.getoption("--strict-production"):
+        _STRICT_PRODUCTION_CONFIG = config
+        _STRICT_PRODUCTION_VIOLATIONS = []
+        warnings.simplefilter("error")
+
+
+def pytest_ignore_collect(collection_path, config):
+    rel_path = _rel_path(collection_path)
+    if "/tests/_legacy_skipped/" in str(collection_path):
+        return True
+    if config.getoption("--strict-production"):
+        path_obj = Path(collection_path)
+        if path_obj.is_file() and rel_path.startswith("tests/"):
+            return not any(pattern.search(rel_path) for pattern in _STRICT_PRODUCTION_INCLUDE_PATTERNS)
+    return False
 
 
 def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--strict-production"):
+        return
+    selected = []
+    deselected = []
     for item in items:
-        try:
-            rel_path = Path(item.fspath).resolve().relative_to(PROJECT_ROOT).as_posix()
-        except Exception:
-            continue
-        if rel_path in _BASELINE_UNSTABLE_TEST_FILES:
-            item.add_marker(pytest.mark.skip(reason="baseline unstable"))
+        rel_path = _rel_path(getattr(item, "fspath", item.path))
+        if any(pattern.search(rel_path) for pattern in _STRICT_PRODUCTION_INCLUDE_PATTERNS):
+            selected.append(item)
+        else:
+            deselected.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
+
+
+def _record_skip(longrepr) -> None:
+    if _STRICT_PRODUCTION_CONFIG is None:
+        return
+    rel_path, reason = _skip_reason(longrepr)
+    if not _approved_skip(rel_path, reason):
+        _STRICT_PRODUCTION_VIOLATIONS.append({"path": rel_path, "reason": reason})
+
+
+def pytest_collectreport(report):
+    if report.skipped:
+        _record_skip(report.longrepr)
+
+
+def pytest_runtest_logreport(report):
+    if report.when == "setup" and report.skipped:
+        _record_skip(report.longrepr)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if not config.getoption("--strict-production"):
+        return
+    if not _STRICT_PRODUCTION_VIOLATIONS:
+        return
+    terminalreporter.section("strict-production violations", red=True, bold=True)
+    for violation in _STRICT_PRODUCTION_VIOLATIONS:
+        terminalreporter.write_line(f"{violation['path']}: {violation['reason']}")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _STRICT_PRODUCTION_CONFIG is None:
+        return
+    if _STRICT_PRODUCTION_VIOLATIONS:
+        session.exitstatus = 1
 
 
 # ── Credential env-var filter ──────────────────────────────────────────────

@@ -9486,6 +9486,7 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        feishu_card_progress = tool_progress_enabled and source.platform == Platform.FEISHU
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -9504,6 +9505,15 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        feishu_progress_count = [0]
+
+        if feishu_card_progress and progress_queue:
+            progress_queue.put({
+                "kind": "feishu_card_progress",
+                "phase": "准备处理",
+                "progress": 6,
+                "count": 1,
+            })
         
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -9512,6 +9522,18 @@ class GatewayRunner:
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in ("tool.started",):
+                return
+
+            if feishu_card_progress:
+                from gateway.feishu_progress import phase_for_tool, progress_for_update_count
+
+                feishu_progress_count[0] += 1
+                progress_queue.put({
+                    "kind": "feishu_card_progress",
+                    "phase": phase_for_tool(tool_name),
+                    "progress": progress_for_update_count(feishu_progress_count[0]),
+                    "count": feishu_progress_count[0] + 1,
+                })
                 return
 
             # "new" mode: only report when tool changes
@@ -9590,6 +9612,108 @@ class GatewayRunner:
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
+
+            if feishu_card_progress:
+                from gateway.feishu_progress import build_feishu_progress_card
+
+                if not hasattr(adapter, "send_interactive_card") or not hasattr(adapter, "edit_interactive_card"):
+                    logger.warning("Feishu card progress requested but adapter has no interactive-card methods")
+                    while not progress_queue.empty():
+                        try:
+                            progress_queue.get_nowait()
+                        except Exception:
+                            break
+                    return
+
+                progress_msg_id = None
+                _last_edit_ts = 0.0
+                _PROGRESS_EDIT_INTERVAL = 1.5
+                start_ts = time.monotonic()
+                latest_phase = "准备处理"
+                latest_progress = 6
+                latest_count = 1
+
+                async def _send_or_update_card(*, done: bool = False) -> None:
+                    nonlocal progress_msg_id, _last_edit_ts
+                    card = build_feishu_progress_card(
+                        phase=latest_phase,
+                        progress_percent=latest_progress,
+                        elapsed_seconds=time.monotonic() - start_ts,
+                        update_count=latest_count,
+                        done=done,
+                    )
+                    if progress_msg_id:
+                        result = await adapter.edit_interactive_card(progress_msg_id, card)
+                    else:
+                        result = await adapter.send_interactive_card(
+                            source.chat_id,
+                            card,
+                            metadata=_progress_metadata,
+                        )
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+                    _last_edit_ts = time.monotonic()
+
+                while True:
+                    try:
+                        if not _run_still_current():
+                            while not progress_queue.empty():
+                                try:
+                                    progress_queue.get_nowait()
+                                except Exception:
+                                    break
+                            return
+
+                        raw = progress_queue.get_nowait()
+                        if not isinstance(raw, dict) or raw.get("kind") != "feishu_card_progress":
+                            continue
+                        latest_phase = str(raw.get("phase") or latest_phase)
+                        try:
+                            latest_progress = int(raw.get("progress", latest_progress))
+                        except (TypeError, ValueError):
+                            pass
+                        try:
+                            latest_count = int(raw.get("count", latest_count))
+                        except (TypeError, ValueError):
+                            pass
+
+                        _now = time.monotonic()
+                        _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                        if _remaining > 0:
+                            await asyncio.sleep(_remaining)
+                        if not _run_still_current():
+                            return
+
+                        await _send_or_update_card()
+
+                    except queue.Empty:
+                        await asyncio.sleep(0.3)
+                    except asyncio.CancelledError:
+                        while not progress_queue.empty():
+                            try:
+                                raw = progress_queue.get_nowait()
+                            except Exception:
+                                break
+                            if isinstance(raw, dict) and raw.get("kind") == "feishu_card_progress":
+                                latest_phase = str(raw.get("phase") or latest_phase)
+                                try:
+                                    latest_progress = int(raw.get("progress", latest_progress))
+                                except (TypeError, ValueError):
+                                    pass
+                                try:
+                                    latest_count = int(raw.get("count", latest_count))
+                                except (TypeError, ValueError):
+                                    pass
+                        if progress_msg_id:
+                            try:
+                                latest_progress = 100
+                                await _send_or_update_card(done=True)
+                            except Exception:
+                                pass
+                        return
+                    except Exception as e:
+                        logger.error("Feishu progress card error: %s", e)
+                        await asyncio.sleep(1)
 
             # Skip tool progress for platforms that don't support message
             # editing (e.g. iMessage/BlueBubbles) — each progress update

@@ -68,6 +68,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -1512,6 +1514,68 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    @staticmethod
+    def _interactive_card_payload(card: Dict[str, Any]) -> str:
+        payload = card.get("card") if isinstance(card, dict) and isinstance(card.get("card"), dict) else card
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def send_interactive_card(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a raw Feishu interactive card."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=self._interactive_card_payload(card),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "interactive card send failed")
+        except Exception as exc:
+            logger.error("[Feishu] Failed to send interactive card: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def edit_interactive_card(self, message_id: str, card: Dict[str, Any]) -> SendResult:
+        """Patch a previously sent Feishu interactive card."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            body = self._build_patch_message_body(content=self._interactive_card_payload(card))
+            request = self._build_patch_message_request(message_id=message_id, request_body=body)
+            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+            result = self._finalize_send_result(response, "interactive card patch failed")
+            if result.success:
+                result.message_id = message_id
+            return result
+        except Exception as exc:
+            logger.error("[Feishu] Failed to patch interactive card %s: %s", message_id, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_card(self, chat_id: str, card: Dict[str, Any]) -> Optional[str]:
+        """Compatibility hook for the shared progress-card dispatcher."""
+        result = await self.send_interactive_card(chat_id, card)
+        return result.message_id if result.success else None
+
+    async def update_card(self, message_id: str, card: Dict[str, Any]) -> bool:
+        """Compatibility hook for the shared progress-card dispatcher."""
+        result = await self.edit_interactive_card(message_id, card)
+        return result.success
+
+    async def send_text(self, chat_id: str, content: str) -> bool:
+        """Compatibility hook for text fallbacks."""
+        result = await self.send(chat_id, content)
+        return result.success
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -3933,6 +3997,27 @@ class FeishuAdapter(BasePlatformAdapter):
         if "UpdateMessageRequest" in globals():
             return (
                 UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if "PatchMessageRequestBody" in globals():
+            return (
+                PatchMessageRequestBody.builder()
+                .content(content)
+                .build()
+            )
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if "PatchMessageRequest" in globals():
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()

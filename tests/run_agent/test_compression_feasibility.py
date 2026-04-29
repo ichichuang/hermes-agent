@@ -4,8 +4,8 @@ compression threshold.
 
 Two-phase design:
   1. __init__  → runs the check, prints via _vprint (CLI), stores warning
-  2. run_conversation (first call) → replays stored warning through
-     status_callback (gateway platforms)
+  2. run_conversation (first call) → only CLI status callbacks replay it;
+     gateway platforms keep the warning out of chat.
 """
 
 from unittest.mock import MagicMock, patch
@@ -29,6 +29,7 @@ def _make_agent(
     agent.base_url = "https://openrouter.ai/api/v1"
     agent.api_key = "sk-test"
     agent.api_mode = "chat_completions"
+    agent.platform = "cli"
     agent.quiet_mode = True
     agent.log_prefix = ""
     agent.compression_enabled = compression_enabled
@@ -348,7 +349,7 @@ def test_just_below_threshold_auto_corrects(mock_get_client, mock_ctx_len):
 @patch("agent.model_metadata.get_model_context_length", return_value=80_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
-    """__init__ stores the warning; _replay sends it through status_callback."""
+    """__init__ stores the warning; CLI replay sends it through status_callback."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.50)
     mock_client = MagicMock()
     mock_client.base_url = "https://openrouter.ai/api/v1"
@@ -372,6 +373,27 @@ def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
         ev == "lifecycle" and "Auto-lowered" in msg
         for ev, msg in callback_events
     )
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=80_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_warning_not_replayed_to_gateway_platforms(mock_get_client, mock_ctx_len):
+    """Gateway platforms should not receive compression setup warnings as chat text."""
+    agent = _make_agent(main_context=200_000, threshold_percent=0.50)
+    agent.platform = "feishu"
+    mock_client = MagicMock()
+    mock_client.base_url = "https://openrouter.ai/api/v1"
+    mock_client.api_key = "sk-aux"
+    mock_get_client.return_value = (mock_client, "google/gemini-3-flash-preview")
+
+    agent._emit_status = lambda msg: None
+    agent._check_compression_model_feasibility()
+
+    callback_events = []
+    agent.status_callback = lambda ev, msg: callback_events.append((ev, msg))
+    agent._replay_compression_warning()
+
+    assert callback_events == []
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=200_000)

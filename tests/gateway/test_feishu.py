@@ -159,6 +159,58 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    def test_send_interactive_card_unwraps_card_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_card"))
+
+        async def _fake_send(**kwargs):
+            return response
+
+        adapter._feishu_send_with_retry = AsyncMock(side_effect=_fake_send)
+
+        result = asyncio.run(
+            adapter.send_interactive_card(
+                "oc_chat",
+                {"card": {"config": {"wide_screen_mode": True}, "elements": []}},
+                metadata={"thread_id": "thread"},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_card")
+        call = adapter._feishu_send_with_retry.await_args.kwargs
+        self.assertEqual(call["chat_id"], "oc_chat")
+        self.assertEqual(call["msg_type"], "interactive")
+        self.assertEqual(call["metadata"], {"thread_id": "thread"})
+        payload = json.loads(call["payload"])
+        self.assertEqual(payload, {"config": {"wide_screen_mode": True}, "elements": []})
+
+    def test_edit_interactive_card_patches_existing_message(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="ignored"))
+        patch = Mock(return_value=response)
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(patch=patch)))
+        )
+
+        result = asyncio.run(
+            adapter.edit_interactive_card(
+                "om_card",
+                {"config": {"wide_screen_mode": True}, "elements": []},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_card")
+        patch.assert_called_once()
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",

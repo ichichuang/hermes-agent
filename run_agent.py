@@ -2281,17 +2281,15 @@ class AIAgent:
             )
 
     def _replay_compression_warning(self) -> None:
-        """Re-send the compression warning through ``status_callback``.
+        """Re-send CLI-only compression warnings through ``status_callback``.
 
         During ``__init__`` the gateway's ``status_callback`` is not yet
-        wired, so ``_emit_status`` only reaches ``_vprint`` (CLI).  This
-        method is called once at the start of the first
-        ``run_conversation()`` — by then the gateway has set the callback,
-        so every platform (Telegram, Discord, Slack, etc.) receives the
-        warning.
+        wired.  These warnings are operational configuration hints, so chat
+        gateway platforms should not receive them as user-visible messages.
         """
         msg = getattr(self, "_compression_warning", None)
-        if msg and self.status_callback:
+        platform = str(getattr(self, "platform", "") or "cli").lower()
+        if msg and self.status_callback and platform == "cli":
             try:
                 self.status_callback("lifecycle", msg)
             except Exception:
